@@ -215,6 +215,7 @@ static const char *caption_shown(const char *s)
         const char *zh;
     } map[] = {
         { "LISTENING...", "正在听..." },
+        { "KEEP TALKING...", "继续说吧..." },
         { "RECORDING...", "录音..." },
         { "SENDING VOICE NOTE", "正在发送语音" },
         { "NOTE SENT - WAITING FOR MUSE", "已发送，等待 Muse" },

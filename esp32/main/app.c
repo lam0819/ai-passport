@@ -2563,6 +2563,14 @@ void app_run(void) {
 
     bool setup_complete = config_setup_complete();
     bool provisioned = config_is_provisioned();
+#ifdef CONFIG_MUSE_CHAT_RELAY
+    /* Relay builds have no Muse pairing step: the device is set up from the
+     * first boot, so no BLE setup window opens and the keeper's paired
+     * checks all pass. */
+    if (!setup_complete) {
+        setup_complete = config_mark_setup_complete();
+    }
+#endif
 
     if (CONFIG_HOMEHUB_WIFI_SSID[0]) {
         // Dev override supplies Wi-Fi from menuconfig and may run token-only in
@@ -2598,6 +2606,16 @@ void app_run(void) {
             setup_complete = false;
         }
     }
+
+#ifdef CONFIG_MUSE_CHAT_RELAY
+    /* The cleanup above may have wiped the marker when no Wi-Fi is saved yet.
+     * Relay builds never pair, so re-mark it and keep the BLE setup window
+     * (Muse app pairing) closed. Wi-Fi is provisioned from the menu/browser
+     * tool instead. */
+    if (!setup_complete) {
+        setup_complete = config_mark_setup_complete();
+    }
+#endif
 
     // Restore endpoints only after saved setup has been validated or repaired.
     if (setup_complete && provisioned) {

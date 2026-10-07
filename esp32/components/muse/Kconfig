@@ -123,6 +123,32 @@ menu "Muse"
             them. Needs PSRAM. Without it, voice notes go over Home Link's own
             session to its paired VM and replies are shown as text.
 
+    config MUSE_CHAT_RELAY
+        bool "Own relay server instead of Muse"
+        depends on MUSE_ENABLED && !MUSE_HATCH
+        default n
+        help
+            Push-to-talk notes go to your own HTTPS endpoint as one POST with
+            a raw 16 kHz mono WAV body; the plain-text reply is shown as the
+            caption. No Muse account, pairing, VM, or Noise session. Set the
+            URL below, plus CONFIG_HOMEHUB_WIFI_SSID and
+            CONFIG_HOMEHUB_WIFI_PASSWORD, and flash. The device reports
+            itself linked as soon as Wi-Fi is up. Without PSRAM, where voice
+            notes otherwise ride Home Link's session.
+
+    config MUSE_CHAT_RELAY_URL
+        string "Relay URL (https://your-host/ask)"
+        depends on MUSE_CHAT_RELAY
+        default ""
+
+    config MUSE_CHAT_RELAY_TOKEN
+        string "Relay bearer token (optional)"
+        depends on MUSE_CHAT_RELAY
+        default ""
+        help
+            Sent as Authorization: Bearer. The relay should require it; the
+            firmware binary can be read out, so treat it as a weak secret.
+
     config MUSE_PASSPORT_HEAP_LOG
         bool "Log Passport internal heap every 5 seconds"
         depends on MUSE_BOARD_PASSPORT

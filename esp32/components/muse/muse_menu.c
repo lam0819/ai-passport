@@ -77,6 +77,7 @@ typedef enum {
     ITEM_SLEEP,
     ITEM_PHONE,
     ITEM_WIFI,
+    ITEM_CONT,
     ITEM_INFO,
     ITEM_BATTERY,
     ITEM_RESET,
@@ -94,6 +95,7 @@ static const char *const ITEM_NAMES[ITEM_COUNT] = {
     [ITEM_SLEEP] = "Auto-sleep",
     [ITEM_PHONE] = "Phone setup",
     [ITEM_WIFI] = "Wi-Fi",
+    [ITEM_CONT] = "Continuous",
     [ITEM_INFO] = "Status",
     [ITEM_BATTERY] = "Battery",
     [ITEM_RESET] = "Reset pairing",
@@ -111,7 +113,8 @@ static const char *const ITEM_ACTIONS[ITEM_COUNT] = {
     [ITEM_MIC] = "Change",
     [ITEM_SLEEP] = "Change",
     [ITEM_PHONE] = "Toggle",
-    [ITEM_WIFI] = "Toggle",
+    [ITEM_WIFI] = "Open",
+    [ITEM_CONT] = "Toggle",
     [ITEM_INFO] = "Open",
     [ITEM_BATTERY] = "Open",
     [ITEM_RESET] = "Select",
@@ -133,6 +136,7 @@ static const char *item_label(int item)
         [ITEM_SLEEP] = "自动休眠",
         [ITEM_PHONE] = "手机设置",
         [ITEM_WIFI] = "Wi-Fi",
+        [ITEM_CONT] = "连续对话",
         [ITEM_INFO] = "状态",
         [ITEM_BATTERY] = "电池",
         [ITEM_RESET] = "重置配对",
@@ -156,7 +160,8 @@ static const char *item_action(int item)
         [ITEM_MIC] = "调节",
         [ITEM_SLEEP] = "调节",
         [ITEM_PHONE] = "切换",
-        [ITEM_WIFI] = "切换",
+        [ITEM_WIFI] = "设置",
+        [ITEM_CONT] = "切换",
         [ITEM_INFO] = "打开",
         [ITEM_BATTERY] = "打开",
         [ITEM_RESET] = "确定",
@@ -189,6 +194,7 @@ typedef enum {
     VIEW_POWER,
     VIEW_RESET,
     VIEW_LAST,          /* previous reply, full screen; OK leaves without talking */
+    VIEW_WIFI,          /* Wi-Fi setup; see the wifi_* block below */
 } view_t;
 
 static QueueHandle_t s_keys;
@@ -297,6 +303,9 @@ static void value_text(int item, char *buf, size_t n)
     case ITEM_WIFI:
         muse_wifi_status(&w);
         strlcpy(buf, WIFI_VALUES[w.state], n);
+        break;
+    case ITEM_CONT:
+        strlcpy(buf, muse_settings_continuous() ? MUSE_UI_T("On", "开") : MUSE_UI_T("Off", "关"), n);
         break;
     case ITEM_BATTERY:
         p = muse_state_power();
@@ -484,6 +493,445 @@ static void step_kept(int dir)
     step_text(s_last_body, &s_last_page, dir);
 }
 
+/* ---------- Wi-Fi setup, button driven (old-phone keypad) ---------- */
+
+typedef enum {
+    WIFI_SUB_LIST,      /* rescan / networks / manual / back */
+    WIFI_SUB_SSID,      /* typing a network name */
+    WIFI_SUB_PASS,      /* typing the password */
+    WIFI_SUB_CONNECT,   /* waiting for the join */
+    WIFI_SUB_DONE,      /* joined */
+} wifi_sub_t;
+
+enum { WROW_SCAN, WROW_AP, WROW_MANUAL, WROW_BACK };
+
+#define WIFI_APS_MAX 12
+#define WIFI_ROWS_MAX 16          /* 12 networks + fixed rows, or the key rows */
+#define WIFI_EDIT_MAX 64
+#define WIFI_PENDING_S 1.2f       /* uncommitted taps turn into the character */
+#define WIFI_POLL_MS 500
+
+/* Old-phone keys: the digit first, then the letters; 0 keeps the space. */
+#define WIFI_KEYS 10
+static const char *const WIFI_KEY_CHARS[WIFI_KEYS] = {
+    "1.@-_#+=",
+    "2abc", "3def", "4ghi", "5jkl", "6mno", "7pqrs", "8tuv", "9wxyz",
+    "0 ",
+};
+enum { WIFI_KEY_DEL = WIFI_KEYS, WIFI_KEY_SHIFT, WIFI_KEY_OK, WIFI_KEY_BACK, WIFI_KEY_ROWS };
+
+static struct {
+    wifi_sub_t sub;
+    int sel;
+    int first;
+    int row_count;
+    uint8_t row_kind[WIFI_ROWS_MAX];
+    int8_t row_ap[WIFI_ROWS_MAX];
+    muse_wifi_ap_t aps[WIFI_APS_MAX];
+    int ap_count;
+    uint32_t scan_gen;
+    bool scanning;
+    char ssid[MUSE_SSID_MAX + 1];
+    bool manual;                 /* the editor is typing a network name */
+    char edit[WIFI_EDIT_MAX + 1];
+    int edit_max;
+    int pending_key;             /* -1: nothing pending */
+    int pending_taps;
+    float pending_at;
+    bool shift;
+    int64_t done_at_us;
+    int64_t next_poll_us;
+} s_wf;
+
+static lv_obj_t *s_wifi;                 /* the whole setup, on the menu root */
+static lv_obj_t *s_wifi_title;
+static lv_obj_t *s_wifi_field;
+static lv_obj_t *s_wifi_list;
+static lv_obj_t *s_wifi_rows[WIFI_ROWS_MAX];
+static int s_wifi_row_h = 24;
+static int s_wifi_visible = 8;
+static const lv_font_t *s_wifi_font;
+
+static void show(view_t view);
+
+static void wifi_rows_clear(void)
+{
+    if (!s_wifi_list) {
+        return;
+    }
+    lv_obj_clean(s_wifi_list);
+    for (int i = 0; i < WIFI_ROWS_MAX; i++) {
+        s_wifi_rows[i] = NULL;
+    }
+    s_wf.row_count = 0;
+}
+
+static void wifi_row_add(const char *text, uint8_t kind, int ap)
+{
+    if (!s_wifi_list || s_wf.row_count >= WIFI_ROWS_MAX) {
+        return;
+    }
+    int i = s_wf.row_count++;
+    lv_obj_t *r = lv_obj_create(s_wifi_list);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_size(r, lv_pct(100), s_wifi_row_h);
+    lv_obj_set_style_pad_hor(r, 8, 0);
+    lv_obj_set_style_radius(r, 6, 0);
+    lv_obj_set_style_bg_color(r, lv_color_hex(COLOR_SELECTED), 0);
+    lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(label(r, s_wifi_font, COLOR_TEXT, text), LV_ALIGN_LEFT_MID, 0, 0);
+    s_wifi_rows[i] = r;
+    s_wf.row_kind[i] = kind;
+    s_wf.row_ap[i] = (int8_t)ap;
+}
+
+static void wifi_highlight(void)
+{
+    if (s_wf.sel >= s_wf.row_count) {
+        s_wf.sel = s_wf.row_count ? s_wf.row_count - 1 : 0;
+    }
+    for (int i = 0; i < s_wf.row_count; i++) {
+        lv_obj_set_style_bg_opa(s_wifi_rows[i], i == s_wf.sel ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
+    if (s_wf.sel < s_wf.first) {
+        s_wf.first = s_wf.sel;
+    } else if (s_wf.sel >= s_wf.first + s_wifi_visible) {
+        s_wf.first = s_wf.sel - s_wifi_visible + 1;
+    }
+    lv_obj_scroll_to_y(s_wifi_list, s_wf.first * s_wifi_row_h, LV_ANIM_OFF);
+}
+
+static void wifi_build_list(void)
+{
+    wifi_rows_clear();
+    if (!muse_settings_wifi_on()) {
+        wifi_row_add(MUSE_UI_T("Turn Wi-Fi on", "打开 Wi-Fi"), WROW_SCAN, -1);
+    } else if (s_wf.scanning) {
+        wifi_row_add(MUSE_UI_T("Scanning...", "扫描中..."), WROW_SCAN, -1);
+    } else {
+        wifi_row_add(MUSE_UI_T("Rescan", "重新扫描"), WROW_SCAN, -1);
+    }
+    if (muse_settings_wifi_on()) {
+        muse_wifi_saved_t saved[MUSE_WIFI_SAVED_MAX];
+        int ns = muse_wifi_saved(saved, MUSE_WIFI_SAVED_MAX);
+        for (int i = 0; i < s_wf.ap_count; i++) {
+            char line[64];
+            bool sv = false;
+            for (int j = 0; j < ns; j++) {
+                if (!strcmp(saved[j].ssid, s_wf.aps[i].ssid)) {
+                    sv = true;
+                }
+            }
+            const char *suffix = sv ? MUSE_UI_T("  (saved)", " 已保存") : "";
+            snprintf(line, sizeof(line), "%s%s", s_wf.aps[i].ssid, suffix);
+            wifi_row_add(line, WROW_AP, i);
+        }
+        wifi_row_add(MUSE_UI_T("Enter name...", "手动输入..."), WROW_MANUAL, -1);
+    }
+    wifi_row_add(MUSE_UI_T("Back", "返回"), WROW_BACK, -1);
+    wifi_highlight();
+}
+
+static void wifi_build_keys(void)
+{
+    wifi_rows_clear();
+    char label_buf[28];
+    for (int i = 0; i < WIFI_KEYS; i++) {
+        if (i == 0) {
+            snprintf(label_buf, sizeof(label_buf), "1 . @ - _ #");
+        } else if (i == 9) {
+            snprintf(label_buf, sizeof(label_buf), MUSE_UI_T("0 space", "0 空格"));
+        } else {
+            snprintf(label_buf, sizeof(label_buf), "%c %s", WIFI_KEY_CHARS[i][0],
+                     WIFI_KEY_CHARS[i] + 1);
+        }
+        wifi_row_add(label_buf, 0, -1);
+    }
+    wifi_row_add(MUSE_UI_T("Del", "删除"), 0, -1);
+    wifi_row_add(s_wf.shift ? MUSE_UI_T("Case: AB", "大写 AB") : MUSE_UI_T("Case: ab", "小写 ab"),
+                 0, -1);
+    wifi_row_add(s_wf.sub == WIFI_SUB_SSID ? MUSE_UI_T("Next", "下一步")
+                                           : MUSE_UI_T("Join", "连接"),
+                 0, -1);
+    wifi_row_add(MUSE_UI_T("Back", "返回"), 0, -1);
+    wifi_highlight();
+}
+
+static void wifi_show_field(void)
+{
+    char buf[WIFI_EDIT_MAX + 8];
+    strlcpy(buf, s_wf.edit, sizeof(buf));
+    if (s_wf.pending_key >= 0) {
+        const char *set = WIFI_KEY_CHARS[s_wf.pending_key];
+        char c = set[s_wf.pending_taps % strlen(set)];
+        if (s_wf.shift && c >= 'a' && c <= 'z') {
+            c = (char)(c - 'a' + 'A');
+        }
+        size_t n = strlen(buf);
+        buf[n] = c;
+        buf[n + 1] = '\0';
+    }
+    set_text(s_wifi_field, buf[0] ? buf : MUSE_UI_T("_", "_"));
+}
+
+static void wifi_commit(void)
+{
+    if (s_wf.pending_key < 0) {
+        return;
+    }
+    const char *set = WIFI_KEY_CHARS[s_wf.pending_key];
+    char c = set[s_wf.pending_taps % strlen(set)];
+    if (s_wf.shift && c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
+    size_t len = strlen(s_wf.edit);
+    if (len < (size_t)s_wf.edit_max) {
+        s_wf.edit[len] = c;
+        s_wf.edit[len + 1] = '\0';
+    }
+    s_wf.pending_key = -1;
+    s_wf.pending_taps = 0;
+}
+
+static void wifi_render_connect(void)
+{
+    char buf[128];
+    muse_wifi_status_t w;
+    muse_wifi_status(&w);
+    if (s_wf.sub == WIFI_SUB_DONE) {
+        snprintf(buf, sizeof(buf), MUSE_UI_T("Connected to\n%s", "已连接\n%s"), s_wf.ssid);
+    } else if (w.state == MUSE_WIFI_FAILED) {
+        snprintf(buf, sizeof(buf), MUSE_UI_T("Couldn't join %s\n\n%s\n\nOK to try again",
+                                             "连接 %s 失败\n\n%s\n\n确定重试"),
+                 s_wf.ssid, w.detail);
+    } else if (w.state == MUSE_WIFI_NOT_NEARBY) {
+        snprintf(buf, sizeof(buf), MUSE_UI_T("Can't find %s", "找不到 %s"), s_wf.ssid);
+    } else {
+        snprintf(buf, sizeof(buf), MUSE_UI_T("Joining %s...", "正在连接 %s..."), s_wf.ssid);
+    }
+    set_text(s_page, buf);
+}
+
+static bool wifi_editing(void)
+{
+    return s_wf.sub == WIFI_SUB_SSID || s_wf.sub == WIFI_SUB_PASS;
+}
+
+static void wifi_render(void)
+{
+    bool editing = wifi_editing();
+    bool status = s_wf.sub == WIFI_SUB_CONNECT || s_wf.sub == WIFI_SUB_DONE;
+    if (s_wf.sub == WIFI_SUB_SSID) {
+        set_text(s_wifi_title, MUSE_UI_T("NETWORK NAME", "网络名"));
+    } else if (s_wf.sub == WIFI_SUB_PASS) {
+        set_text(s_wifi_title, s_wf.ssid);
+    } else if (s_wf.sub == WIFI_SUB_LIST) {
+        set_text(s_wifi_title, MUSE_UI_T("WI-FI SETUP", "Wi-Fi 设置"));
+    } else {
+        set_text(s_wifi_title, s_wf.ssid);
+    }
+    lv_obj_set_flag(s_wifi_field, LV_OBJ_FLAG_HIDDEN, !editing);
+    lv_obj_set_flag(s_wifi_list, LV_OBJ_FLAG_HIDDEN, status);
+    if (editing) {
+        wifi_show_field();
+        wifi_build_keys();
+        select_hint(MUSE_UI_T("Type", "输入"));
+        set_text(s_hint_down, s_down_text);
+    } else if (s_wf.sub == WIFI_SUB_LIST) {
+        wifi_build_list();
+        select_hint(MUSE_UI_T("Select", "选择"));
+        set_text(s_hint_down, s_down_text);
+    } else {
+        lv_obj_set_flag(s_page, LV_OBJ_FLAG_HIDDEN, false);
+        wifi_render_connect();
+        select_hint(MUSE_UI_T("Back", "返回"));
+        set_text(s_hint_down, "");
+    }
+    if (!status) {
+        lv_obj_set_flag(s_page, LV_OBJ_FLAG_HIDDEN, true);
+    }
+}
+
+static void wifi_start_scan(void)
+{
+    if (muse_wifi_scan() == ESP_OK) {
+        s_wf.scanning = true;
+        wifi_render();
+    }
+}
+
+static void wifi_join(void)
+{
+    ESP_LOGI(TAG, "wifi join %s (%d chars)", s_wf.ssid, (int)strlen(s_wf.edit));
+    muse_settings_set_wifi_on(true);
+    muse_settings_set_wifi(s_wf.ssid, s_wf.edit);
+    s_wf.sub = WIFI_SUB_CONNECT;
+    s_wf.done_at_us = 0;
+    wifi_render();
+}
+
+static void wifi_open(void)
+{
+    /* The phone-setup radio is only for the browser tool; the on-device
+     * setup manages Wi-Fi directly and wants the ~30 KB back. */
+    if (muse_settings_ble_on()) {
+        muse_settings_set_ble_on(false);
+    }
+    memset(&s_wf, 0, sizeof(s_wf));
+    s_wf.sub = WIFI_SUB_LIST;
+    s_wf.sel = 0;
+    s_wf.pending_key = -1;
+    s_wf.scan_gen = 0xffffffffu;
+    if (muse_settings_wifi_on()) {
+        wifi_start_scan();
+    }
+    show(VIEW_WIFI);
+}
+
+static void wifi_move(int dir)
+{
+    if (s_wf.sub == WIFI_SUB_LIST || wifi_editing()) {
+        wifi_commit();
+    }
+    if (s_wf.row_count == 0) {
+        return;
+    }
+    s_wf.sel = (s_wf.sel + dir + s_wf.row_count) % s_wf.row_count;
+    wifi_highlight();
+}
+
+static void wifi_list_select(void)
+{
+    int kind = s_wf.row_kind[s_wf.sel];
+    if (kind == WROW_SCAN) {
+        if (!muse_settings_wifi_on()) {
+            muse_settings_set_wifi_on(true);
+            s_wf.ap_count = 0;
+            s_wf.scan_gen = 0xffffffffu;
+        }
+        wifi_start_scan();
+    } else if (kind == WROW_AP) {
+        int ai = s_wf.row_ap[s_wf.sel];
+        strlcpy(s_wf.ssid, s_wf.aps[ai].ssid, sizeof(s_wf.ssid));
+        if (!s_wf.aps[ai].secure) {
+            s_wf.edit[0] = '\0';
+            s_wf.edit_max = MUSE_PASS_MAX;
+            wifi_join();
+            return;
+        }
+        s_wf.manual = false;
+        s_wf.edit[0] = '\0';
+        s_wf.edit_max = MUSE_PASS_MAX;
+        s_wf.pending_key = -1;
+        s_wf.shift = false;
+        s_wf.sel = 0;
+        s_wf.sub = WIFI_SUB_PASS;
+        wifi_render();
+    } else if (kind == WROW_MANUAL) {
+        s_wf.manual = true;
+        s_wf.edit[0] = '\0';
+        s_wf.edit_max = MUSE_SSID_MAX;
+        s_wf.pending_key = -1;
+        s_wf.shift = false;
+        s_wf.sel = 0;
+        s_wf.sub = WIFI_SUB_SSID;
+        wifi_render();
+    } else {
+        show(VIEW_LIST);
+    }
+}
+
+static void wifi_edit_select(void)
+{
+    int row = s_wf.sel;
+    if (row < WIFI_KEYS) {
+        if (s_wf.pending_key != row) {
+            wifi_commit();
+            s_wf.pending_key = row;
+            s_wf.pending_taps = 0;
+        }
+        s_wf.pending_taps++;
+        s_wf.pending_at = s_last_key;
+        wifi_show_field();
+    } else if (row == WIFI_KEY_DEL) {
+        wifi_commit();
+        size_t len = strlen(s_wf.edit);
+        if (len) {
+            s_wf.edit[len - 1] = '\0';
+        }
+        wifi_show_field();
+    } else if (row == WIFI_KEY_SHIFT) {
+        wifi_commit();
+        s_wf.shift = !s_wf.shift;
+        wifi_show_field();
+        wifi_build_keys();
+    } else if (row == WIFI_KEY_OK) {
+        wifi_commit();
+        if (s_wf.sub == WIFI_SUB_SSID) {
+            if (!s_wf.edit[0]) {
+                return;
+            }
+            strlcpy(s_wf.ssid, s_wf.edit, sizeof(s_wf.ssid));
+            s_wf.manual = false;
+            s_wf.edit[0] = '\0';
+            s_wf.edit_max = MUSE_PASS_MAX;
+            s_wf.pending_key = -1;
+            s_wf.sel = 0;
+            s_wf.sub = WIFI_SUB_PASS;
+            wifi_render();
+        } else {
+            wifi_join();
+        }
+    } else {
+        wifi_commit();
+        s_wf.sub = WIFI_SUB_LIST;
+        s_wf.sel = 0;
+        wifi_render();
+    }
+}
+
+static void wifi_tick(float now)
+{
+    int64_t us = esp_timer_get_time();
+    if (s_wf.pending_key >= 0 && now - s_wf.pending_at > WIFI_PENDING_S) {
+        wifi_commit();
+        wifi_show_field();
+    }
+    if (s_wf.sub == WIFI_SUB_LIST && muse_settings_wifi_on()) {
+        bool scanning = muse_wifi_scanning();
+        if (scanning != s_wf.scanning) {
+            s_wf.scanning = scanning;
+            wifi_render();
+        } else if (us >= s_wf.next_poll_us && !scanning) {
+            s_wf.next_poll_us = us + WIFI_POLL_MS * 1000;
+            uint32_t gen = 0;
+            int n = muse_wifi_scan_results(s_wf.aps, WIFI_APS_MAX, &gen);
+            if (gen != s_wf.scan_gen) {
+                s_wf.scan_gen = gen;
+                s_wf.ap_count = n;
+                wifi_render();
+            }
+        }
+    }
+    if (s_wf.sub == WIFI_SUB_CONNECT && us >= s_wf.next_poll_us) {
+        s_wf.next_poll_us = us + WIFI_POLL_MS * 1000;
+        muse_wifi_status_t w;
+        muse_wifi_status(&w);
+        if (w.state == MUSE_WIFI_CONNECTED && w.ssid[0] && !strcmp(w.ssid, s_wf.ssid)) {
+            s_wf.sub = WIFI_SUB_DONE;
+            s_wf.done_at_us = us;
+        }
+        wifi_render_connect();
+        if (s_wf.sub == WIFI_SUB_DONE) {
+            wifi_render();
+        }
+    }
+    if (s_wf.sub == WIFI_SUB_DONE && s_wf.done_at_us && us - s_wf.done_at_us > 1500000) {
+        muse_state_set_caption(MUSE_UI_T("WI-FI CONNECTED", "Wi-Fi 已连接"));
+        muse_menu_close();
+    }
+}
+
 static void refresh(void)
 {
     char buf[384];
@@ -528,6 +976,7 @@ static const char *view_name(view_t view)
     case VIEW_POWER: return "power";
     case VIEW_RESET: return "reset";
     case VIEW_LAST: return "last";
+    case VIEW_WIFI: return "wifi";
     default: return "closed";
     }
 }
@@ -550,11 +999,18 @@ static void show(view_t view)
     s_shown_sel = -1;
     s_batt_shown_us = 0;
     lv_obj_set_flag(s_list, LV_OBJ_FLAG_HIDDEN, view != VIEW_LIST);
-    lv_obj_set_flag(s_page, LV_OBJ_FLAG_HIDDEN, view == VIEW_LIST);
+    lv_obj_set_flag(s_page, LV_OBJ_FLAG_HIDDEN, view == VIEW_LIST || view == VIEW_WIFI);
+    lv_obj_set_flag(s_title, LV_OBJ_FLAG_HIDDEN, view == VIEW_WIFI);
+    if (s_wifi) {
+        lv_obj_set_flag(s_wifi, LV_OBJ_FLAG_HIDDEN, view != VIEW_WIFI);
+    }
     bool danger = view == VIEW_POWER || view == VIEW_RESET;
     lv_obj_set_style_text_color(s_hint_select, lv_color_hex(danger ? COLOR_DANGER : COLOR_TEXT), 0);
 
     switch (view) {
+    case VIEW_WIFI:
+        wifi_render();
+        break;
     case VIEW_STATUS:
         set_text(s_title, MUSE_UI_T("STATUS", "状态"));
         select_hint(MUSE_UI_T("Back", "返回"));   /* OK returns to the list; Down pages, it is not Back */
@@ -651,7 +1107,10 @@ static void activate(int item, int direction)
         muse_settings_set_ble_on(!muse_settings_ble_on());
         break;
     case ITEM_WIFI:
-        muse_settings_set_wifi_on(!muse_settings_wifi_on());
+        wifi_open();
+        break;
+    case ITEM_CONT:
+        muse_settings_set_continuous(!muse_settings_continuous());
         break;
     case ITEM_INFO:
         show(VIEW_STATUS);
@@ -736,6 +1195,40 @@ static void handle(muse_menu_key_t key)
         } else if (key == MUSE_MENU_DOWN) {
             step_kept(1);
         } else if (key == MUSE_MENU_SELECT || key == MUSE_MENU_BACK) {
+            muse_menu_close();
+        }
+        break;
+    case VIEW_WIFI:
+        if (s_wf.sub == WIFI_SUB_LIST) {
+            if (key == MUSE_MENU_UP) {
+                wifi_move(-1);
+            } else if (key == MUSE_MENU_DOWN) {
+                wifi_move(1);
+            } else if (key == MUSE_MENU_SELECT) {
+                wifi_list_select();
+            } else if (key == MUSE_MENU_BACK) {
+                show(VIEW_LIST);
+            }
+        } else if (wifi_editing()) {
+            if (key == MUSE_MENU_UP) {
+                wifi_move(-1);
+            } else if (key == MUSE_MENU_DOWN) {
+                wifi_move(1);
+            } else if (key == MUSE_MENU_SELECT) {
+                wifi_edit_select();
+            } else if (key == MUSE_MENU_BACK) {
+                wifi_commit();
+                s_wf.sub = WIFI_SUB_LIST;
+                s_wf.sel = 0;
+                wifi_render();
+            }
+        } else if (s_wf.sub == WIFI_SUB_CONNECT) {
+            if (key == MUSE_MENU_SELECT || key == MUSE_MENU_BACK) {
+                s_wf.sub = WIFI_SUB_LIST;
+                s_wf.sel = 0;
+                wifi_render();
+            }
+        } else {   /* DONE */
             muse_menu_close();
         }
         break;
@@ -846,6 +1339,35 @@ void muse_menu_build(lv_obj_t *parent, int w, int h)
     lv_obj_set_pos(s_page, 2 * pad, title_h + pad);
     lv_obj_add_flag(s_page, LV_OBJ_FLAG_HIDDEN);
 
+    /* Wi-Fi setup shares the screen. Created under the hints, which stay on top. */
+    s_wifi = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_wifi);
+    lv_obj_set_size(s_wifi, w, h);
+    lv_obj_remove_flag(s_wifi, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_wifi, LV_OBJ_FLAG_HIDDEN);
+    s_wifi_title = label(s_wifi, title_font, COLOR_DIM, "");
+    lv_obj_align(s_wifi_title, LV_ALIGN_TOP_MID, 0, small ? 3 : 12);
+    s_wifi_field = label(s_wifi, row_font, COLOR_TEXT, "");
+    lv_obj_set_width(s_wifi_field, w - 2 * pad);
+    lv_obj_set_style_text_align(s_wifi_field, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wifi_field, LV_ALIGN_TOP_MID, 0, title_h);
+    s_wifi_row_h = small ? 20 : 24;
+    int wifi_top = title_h + (small ? 0 : lv_font_get_line_height(row_font) + 2);
+    int wifi_h = h - wifi_top - hint_h;
+    s_wifi_list = lv_obj_create(s_wifi);
+    lv_obj_remove_style_all(s_wifi_list);
+    lv_obj_set_size(s_wifi_list, w - strip, wifi_h);
+    lv_obj_set_pos(s_wifi_list, 0, wifi_top);
+    lv_obj_set_style_pad_hor(s_wifi_list, pad, 0);
+    lv_obj_set_flex_flow(s_wifi_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(s_wifi_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(s_wifi_list, LV_OBJ_FLAG_CLICKABLE);
+    s_wifi_visible = wifi_h / s_wifi_row_h;
+    if (s_wifi_visible < 1) {
+        s_wifi_visible = 1;
+    }
+    s_wifi_font = row_font;
+
     /* Hints sit next to their buttons, where the face shows their icons. */
     lv_obj_t *rule = lv_obj_create(s_root);
     lv_obj_remove_style_all(rule);
@@ -903,6 +1425,12 @@ bool muse_menu_tick(float now)
     }
     if (s_view == VIEW_CLOSED) {
         return false;
+    }
+    if (s_view == VIEW_WIFI) {
+        wifi_tick(now);
+        if (s_view == VIEW_CLOSED) {
+            return false;
+        }
     }
     if (now - s_last_key > IDLE_CLOSE_S) {
         muse_menu_close();

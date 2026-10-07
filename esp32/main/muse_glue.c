@@ -46,6 +46,14 @@
 
 static const char *TAG = "link.muse";
 
+/* A relay build (CONFIG_MUSE_CHAT_RELAY) has no Muse pairing: the device is
+ * linked as soon as the build exists, and Wi-Fi is the only connectivity. */
+#ifdef CONFIG_MUSE_CHAT_RELAY
+#define MUSE_GLUE_RELAY 1
+#else
+#define MUSE_GLUE_RELAY 0
+#endif
+
 #define BIT_STORAGE     BIT0    // NVS + identity ready: Muse may start
 #define BIT_LINK        BIT1    // boot connect done: Muse may use the radios
 #define BIT_MUSE        BIT2    // Muse settings loaded
@@ -144,7 +152,7 @@ static bool load_creds(void) {
     }
     portEXIT_CRITICAL(&s_lock);
     memset(pass, 0, sizeof(pass));
-    s_linked = config_is_provisioned();
+    s_linked = config_is_provisioned() || MUSE_GLUE_RELAY;
     return changed;
 }
 
@@ -305,7 +313,17 @@ static bool saved_locked(const char *ssid) {
 static void scan_task(void *arg) {
     (void)arg;
     wifi_scan_entry_t found[SCAN_MAX];
-    int n = wifi_mgr_scan(found, SCAN_MAX, 0, NULL);
+    /* The keeper may be scanning for a saved network at the same moment; the
+     * radio answers one scan at a time, so wait it out instead of dropping
+     * the results the menu is waiting for. */
+    int n = -1;
+    for (int tries = 0; tries < 8; tries++) {
+        n = wifi_mgr_scan(found, SCAN_MAX, 0, NULL);
+        if (n >= 0) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
     if (n >= 0) {
         int64_t now = esp_timer_get_time();
         portENTER_CRITICAL(&s_lock);
@@ -611,7 +629,12 @@ static void keeper_task(void *arg) {
                 s_chosen = s_chosen || first;
                 next_try = now + 1000 * 1000;
             }
-            s_linked = config_is_provisioned();
+            s_linked = config_is_provisioned() || MUSE_GLUE_RELAY;
+        }
+
+        if (MUSE_GLUE_RELAY && s_linked && wifi_mgr_is_connected()) {
+            /* No Home Link session to mark the device online; Wi-Fi is it. */
+            muse_link_set_state(MUSE_LINK_ONLINE);
         }
 
         pending = 0;

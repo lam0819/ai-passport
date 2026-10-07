@@ -47,18 +47,21 @@ URL above when regenerating.
 
 ## Character set
 
-GB2312-80, decoded as EUC-CN (row byte `0xA0+row`, column byte `0xA0+col`):
+GB2312-80, decoded as EUC-CN (row byte `0xA0+row`, column byte `0xA0+col`),
+plus Big5 level 1 and the spoken-Cantonese characters:
 
 | Range | What | Count |
 |---|---|---|
-| rows 16–55 | level-1 hanzi | 3755 |
-| rows 1–3 | punctuation, numerals, fullwidth forms (empty slots skipped) | 260 defined |
+| GB2312 rows 16–55 | level-1 hanzi | 3755 |
+| GB2312 rows 1–3 | punctuation, numerals, fullwidth forms (empty slots skipped) | 260 defined |
+| Big5 level 1 | common Traditional hanzi (`0xA440–0xC67E`) | 5401 (deduplicated against GB2312) |
+| `CANTONESE` in `gen_cjk_font.py` | written spoken Cantonese (嘅, 咗, 喺, …) | 31 |
 | ASCII `0x20–0x7E` | printable ASCII, passed as a range | 95 |
-| rows 4–9 | kana, Greek, Cyrillic, bopomofo, line drawing | left out |
+| GB2312 rows 4–9 | kana, Greek, Cyrillic, bopomofo, line drawing | left out |
 
-ASCII duplicates inside rows 1–3 are dropped. The symbol list is 4015
-characters (12036 UTF-8 bytes). `glyph_dsc` has 4111 entries: id 0 reserved,
-plus 95 ASCII, plus 4015 symbols. A level-2 hanzi is not in the font, so LVGL
+ASCII duplicates inside rows 1–3 are dropped. The symbol list is 7102
+characters (21297 UTF-8 bytes). `glyph_dsc` has 7198 entries: id 0 reserved,
+plus 95 ASCII, plus 7102 symbols. A level-2 hanzi is not in the font, so LVGL
 draws its placeholder.
 
 ## Size
@@ -68,17 +71,17 @@ set, measured by `gen_cjk_font.py`:
 
 | Variant | Bin bytes |
 |---|---|
-| 14px 4bpp `--no-compress` | 425852 |
-| 14px 2bpp `--no-compress` | 232504 |
-| 14px 4bpp compressed | 354832 |
-| 14px 2bpp compressed | 210872 |
+| 14px 4bpp `--no-compress` | 758504 |
+| 14px 2bpp `--no-compress` | 413564 |
+| 14px 4bpp compressed | 647804 |
+| 14px 2bpp compressed | 381708 |
 
 The committed file is the 4 bpp uncompressed font. The largest
-`.bitmap_index` is 385208, under the 20-bit field, so
-`LV_FONT_FMT_TXT_LARGE` stays off. Compression would save about 71 KB of the
+`.bitmap_index` is 687257, under the 20-bit field, so
+`LV_FONT_FMT_TXT_LARGE` stays off. Compression would save about 111 KB of the
 4 bpp bin and needs `LV_USE_FONT_COMPRESSED`, whose reader allocates a line
 buffer per glyph. This board has no spare internal RAM for that. `.line_height`
-is 18 and `.base_line` is 4. The `.c` file is about 2.87 MB of source; the
+is 18 and `.base_line` is 4. The `.c` file is about 5.12 MB of source; the
 bin above is the flash bitmap size before the descriptor tables.
 
 ## Regenerating

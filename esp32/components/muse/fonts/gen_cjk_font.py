@@ -48,14 +48,35 @@ def gb2312_rows(rows: range) -> list[str]:
     return found
 
 
-def charset() -> str:
-    """GB2312 level-1 hanzi, plus that standard's punctuation and fullwidth rows.
+CANTONESE = (
+    "嘅咗喺嗰啲咁乜嘢嚟攞掂冧諗攰掟冇睇俾哋唔喎啩嘥嘞啫咋咩咪囉嗌嘮嚿㗎㖭嗱喲"
+)
 
-    Rows 1-3 are punctuation, numerals/roman, and fullwidth ASCII. Rows 16-55
-    are the 3755 level-1 hanzi. Printable ASCII is passed as a range, not here.
-    Rows 4-9 (kana, Greek, Cyrillic, bopomofo, line drawing) are left out.
+
+def big5_level1() -> list[str]:
+    """Big5 level-1 hanzi: the 5401 common Traditional characters."""
+    found = []
+    for hi in range(0xA4, 0xC7):          # 0xA440 .. 0xC67E
+        for lo in list(range(0x40, 0x7F)) + list(range(0xA1, 0xFF)):
+            try:
+                found.append(bytes((hi, lo)).decode("big5"))
+            except UnicodeDecodeError:
+                continue
+    return found
+
+
+def charset() -> str:
+    """GB2312 level-1, Big5 level-1, and spoken Cantonese.
+
+    Rows 1-3 of GB2312 are punctuation, numerals/roman, and fullwidth ASCII;
+    rows 16-55 are its 3755 level-1 hanzi. Big5 level-1 adds the common
+    Traditional characters, and CANTONESE covers the written spoken-Cantonese
+    characters (嘅, 咗, 喺...) that neither standard carries. Printable ASCII
+    is passed as a range, not here. The replies are Cantonese, so a
+    Simplified-only subset would leave blanks on screen.
     """
-    chars = gb2312_rows(range(1, 4)) + gb2312_rows(range(16, 56))
+    chars = (gb2312_rows(range(1, 4)) + gb2312_rows(range(16, 56))
+             + big5_level1() + list(CANTONESE))
     seen: set[str] = set()
     out: list[str] = []
     for ch in chars:

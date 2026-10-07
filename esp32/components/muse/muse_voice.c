@@ -417,7 +417,7 @@ static bool hatch_reply(bool *delivered)
             case MUSE_HATCH_EV_SENT:
                 *delivered = true;
                 if (!speaking && !replied) {
-                    muse_state_set_caption("NOTE SENT - WAITING FOR MUSE");
+                    muse_state_set_caption("NOTE SENT - WAITING FOR REPLY");
                 }
                 break;
             case MUSE_HATCH_EV_REPLY:
@@ -491,9 +491,9 @@ static const char *not_ready_reason(void)
     muse_hatch_status_t st;
     muse_hatch_status(&st);
     switch (st.state) {
-    case MUSE_HATCH_NOT_SET: return "SET UP MUSE FIRST";
+    case MUSE_HATCH_NOT_SET: return "SET UP RELAY FIRST";
     case MUSE_HATCH_OFFLINE: return "NO WI-FI";
-    default: return "CAN'T REACH MUSE";
+    default: return "CAN'T REACH SERVER";
     }
 }
 
@@ -814,6 +814,86 @@ static bool finish_note(void)
     return hatch_reply(&delivered);
 }
 
+/* ---- Continuous conversation ---- */
+
+#define CONT_WAIT_US (6LL * 1000 * 1000)   /* no speech this long: stop listening */
+#define CONT_SILENCE_CHUNKS 50             /* ~1 s of quiet ends the turn */
+#define CONT_MIN_CHUNKS 6                  /* ignore blips */
+#define CONT_MAX_TURNS 8
+#define CONT_SPEECH_DBFS (-42.0f)
+
+typedef enum { CONT_IDLE, CONT_RECORDED, CONT_ABORT } cont_t;
+
+/* A press is queued (without consuming it): continuous listening backs off. */
+static bool cont_press_waiting(void)
+{
+    muse_input_event_t ev;
+    while (xQueuePeek(s_queue, &ev, 0) == pdTRUE) {
+        if (ev.type == MUSE_PTT_DOWN) {
+            return true;
+        }
+        xQueueReceive(s_queue, &ev, 0);
+    }
+    return false;
+}
+
+/*
+ * After a reply, listen again without a press. Waits for speech, records
+ * until the room goes quiet, and leaves the turn open: the caller ends it
+ * (finish_note) so the reply flows as usual. A queued press aborts.
+ */
+static cont_t continuous_listen(void)
+{
+    /* What the speaker left in the air must not count as speech. */
+    for (int i = 0; i < SETTLE_CHUNKS; i++) {
+        muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK);
+    }
+    muse_state_set_mode(MUSE_MODE_LISTENING);
+    muse_state_set_caption("KEEP TALKING...");
+    int64_t start = esp_timer_get_time();
+    bool live = false;
+    int silence = 0;
+    size_t n = 0;
+    for (;;) {
+        if (cont_press_waiting()) {
+            if (live) {
+                muse_hatch_turn_cancel();
+            }
+            return CONT_ABORT;
+        }
+        if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
+        if (!live) {
+            if (db > CONT_SPEECH_DBFS) {
+                live = true;
+                muse_hatch_turn_begin();
+                muse_state_set_caption("LISTENING...");
+            } else if (esp_timer_get_time() - start > CONT_WAIT_US) {
+                return CONT_IDLE;
+            } else {
+                continue;
+            }
+        }
+        muse_state_set_level(muse_audio_level(s_chunk, MUSE_AUDIO_CHUNK));
+        muse_hatch_turn_audio(s_chunk, MUSE_AUDIO_CHUNK);
+        n += MUSE_AUDIO_CHUNK;
+        if (db < CONT_SPEECH_DBFS) {
+            silence++;
+        } else {
+            silence = 0;
+        }
+        if (n >= MAX_FRAMES
+            || (silence >= CONT_SILENCE_CHUNKS && n >= CONT_MIN_CHUNKS * MUSE_AUDIO_CHUNK)) {
+            break;
+        }
+    }
+    muse_state_set_level(0);
+    return CONT_RECORDED;
+}
+
 /*
  * Whether a press can record: Hatch within reach, or (HOLD_NOTES) set up
  * with room to save the note. If not, the caption says why.
@@ -961,6 +1041,19 @@ static void voice_task(void *arg)
         }
         pending_down = finish_note();
         pre_reset();
+        /* Continuous conversation: after a completed turn, listen again
+         * without a press until the room stays quiet or a press comes. */
+        for (int turns = 0;
+             !pending_down && turns < CONT_MAX_TURNS && muse_settings_continuous()
+             && muse_hatch_ready() && !muse_state_asleep();
+             turns++) {
+            cont_t c = continuous_listen();
+            if (c != CONT_RECORDED) {
+                break;
+            }
+            pending_down = finish_note();
+            pre_reset();
+        }
         if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
             muse_state_make_happy();
             go_idle("");

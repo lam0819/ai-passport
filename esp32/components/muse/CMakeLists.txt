@@ -46,7 +46,11 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")
         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
     else()
-        list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
+        if(CONFIG_MUSE_CHAT_RELAY)
+            list(APPEND srcs "muse_chat_relay.c")   # our own HTTPS relay, no Muse
+        else()
+            list(APPEND srcs "muse_chat_link.c")    # text replies over Link's session
+        endif()
     endif()
     list(APPEND srcs "muse_chat_text.c")
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
